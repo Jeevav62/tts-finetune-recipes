@@ -718,10 +718,31 @@ class DurationEncoder(nn.Module):
         return mask
 
 
+class BatchSafeJDCNet(JDCNet):
+    """JDCNet whose F0 output always keeps the batch dimension.
+
+    The stock StyleTTS2 ``JDCNet.forward`` returns ``classifier_out.squeeze()``.
+    With ``num_class=1`` that is meant to drop only the trailing class
+    dimension, but at batch size 1 it also drops the batch dimension, so F0
+    comes back as ``(T,)`` instead of ``(1, T)`` and the decoder's
+    ``torch.cat([asr, F0, N], axis=1)`` fails. ``Utils/`` is not tracked in
+    this repo, so the shape is restored here instead. Batch sizes > 1, and
+    copies of ``Utils/JDC/model.py`` that already use ``squeeze(-1)``, are
+    left unchanged. No parameters are added, so checkpoints load and save
+    exactly as before.
+    """
+
+    def forward(self, x):
+        f0, gan_feature, poolblock_out = super().forward(x)
+        if f0.dim() != 2:
+            f0 = f0.reshape(x.shape[0], -1)
+        return f0, gan_feature, poolblock_out
+
+
 def load_F0_models(path):
     # load F0 model
 
-    F0_model = JDCNet(num_class=1, seq_len=192)
+    F0_model = BatchSafeJDCNet(num_class=1, seq_len=192)
     params = torch.load(path, map_location="cpu")["net"]
     F0_model.load_state_dict(params)
     _ = F0_model.train()
@@ -861,13 +882,72 @@ def build_model(args, text_aligner, pitch_extractor, bert):
     return nets
 
 
-def load_checkpoint(model, optimizer, path, load_only_params=True, ignore_modules=[]):
+_DP_PREFIX = "module."
+
+
+def match_module_prefix(sd, own_keys):
+    """Return ``sd`` with the DataParallel/DDP ``module.`` prefix stripped or added
+    so its keys line up with ``own_keys`` (the target module's state_dict keys).
+
+    Stage 2 saves its modules while they are wrapped in ``MyDataParallel``, so
+    every key there starts with ``module.``; Stage 1 (single-process accelerate)
+    and kokoro_base.pth do not. ``load_state_dict(strict=False)`` silently skips
+    keys that don't match, so without this a Stage 2 resume loaded NO weights.
+    """
+    if not sd:
+        return sd
+    ck_pref = all(k.startswith(_DP_PREFIX) for k in sd)
+    own_pref = bool(own_keys) and all(k.startswith(_DP_PREFIX) for k in own_keys)
+    if ck_pref and not own_pref:
+        return {k[len(_DP_PREFIX):]: v for k, v in sd.items()}
+    if own_pref and not ck_pref:
+        return {_DP_PREFIX + k: v for k, v in sd.items()}
+    return sd
+
+
+class CheckpointLoadError(RuntimeError):
+    pass
+
+
+def load_checkpoint(model, optimizer, path, load_only_params=True, ignore_modules=[],
+                    max_missing_frac=None):
+    """Load ``state["net"]`` into ``model`` module by module.
+
+    Fails loudly (CheckpointLoadError) instead of silently training from
+    scratch: for every module that is loaded, the share of the module's own
+    tensors left missing, or of checkpoint tensors left unused, must not exceed
+    ``max_missing_frac`` (default 0.02, override with KOKORO_MAX_MISSING_FRAC).
+    """
+    if max_missing_frac is None:
+        max_missing_frac = float(os.environ.get("KOKORO_MAX_MISSING_FRAC", "0.02"))
     state = torch.load(path, map_location="cpu")
     params = state["net"]
+    problems = []
+    n_loaded_modules = 0
+    tot_own = tot_missing = 0
     for key in model:
         if key in params and key not in ignore_modules:
-            print("%s loaded" % key)
-            model[key].load_state_dict(params[key], strict=False)
+            own_keys = list(model[key].state_dict().keys())
+            sd = match_module_prefix(params[key], own_keys)
+            res = model[key].load_state_dict(sd, strict=False)
+            n_own, n_ck = len(own_keys), len(sd)
+            n_miss, n_unexp = len(res.missing_keys), len(res.unexpected_keys)
+            n_loaded_modules += 1
+            tot_own += n_own
+            tot_missing += n_miss
+            print("%s loaded (%d/%d tensors; missing %d, unexpected %d)"
+                  % (key, n_own - n_miss, n_own, n_miss, n_unexp))
+            if (n_own and n_miss / n_own > max_missing_frac) or (n_ck and n_unexp / n_ck > max_missing_frac):
+                problems.append("%s: missing %d/%d (e.g. %s), unexpected %d/%d (e.g. %s)" % (
+                    key, n_miss, n_own, res.missing_keys[:2], n_unexp, n_ck, res.unexpected_keys[:2]))
+    print("[load_checkpoint] %s: %d modules, %d/%d tensors loaded"
+          % (osp.basename(path), n_loaded_modules, tot_own - tot_missing, tot_own))
+    if n_loaded_modules == 0:
+        problems.append("no module of the model was found in the checkpoint (keys: %s)" % list(params)[:10])
+    if problems:
+        raise CheckpointLoadError(
+            "Checkpoint %s did not load cleanly (threshold %.0f%%; set KOKORO_MAX_MISSING_FRAC to override):\n  %s"
+            % (path, 100 * max_missing_frac, "\n  ".join(problems)))
     _ = [model[key].eval() for key in model]
 
     if not load_only_params:

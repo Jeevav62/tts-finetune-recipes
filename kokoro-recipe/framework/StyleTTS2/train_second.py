@@ -1,5 +1,7 @@
 # load packages
 import setproctitle; setproctitle.setproctitle("kokoro-stage2-sara")
+import os
+import contextlib
 import copy
 import random
 import yaml
@@ -8,7 +10,10 @@ from munch import Munch
 import numpy as np
 import torch
 
-torch.autograd.set_detect_anomaly(True)
+# Debug only. Leaving anomaly detection on makes Stage 2 several times slower
+# (it records a stack trace for every autograd op and runs extra NaN checks
+# in backward). Re-enable temporarily when hunting a NaN.
+# torch.autograd.set_detect_anomaly(True)
 
 if getattr(torch, "_original_load", None) is None:
     torch._original_load = torch.load
@@ -340,6 +345,40 @@ def main(config_path):
     _ = [model[key].train() for key in model]
     # ─────────────────────────────────────────────────────────────────────────
 
+    # Optional cuDNN fallback for the SLM-adversarial step.
+    # (Keep the exact crash strings out of anything printed here: stage2.slm_disable_cudnn:
+    # auto searches the previous logs/stage2.log for them.)
+    # With torch 2.6.0 (CUDA 12.4, cuDNN 9.1.0) the SLM generator backward
+    # (loss_gen_lm.backward()) crashes after a few dozen to a few hundred SLM steps with
+    # "CUDA error: an illegal memory access was encountered" (or, with
+    # CUDA_LAUNCH_BLOCKING=1, cuDNN "GET was unable to find an engine to execute this
+    # computation"). torch 2.8.0 (cuDNN 9.10.2) does not show it, which is why
+    # requirements.txt pins torch 2.8.0. On older torch builds, turning this on runs only
+    # the SLM forward/backward with native CUDA kernels instead of cuDNN; the rest of the
+    # step keeps cuDNN.
+    # Set via stage2.slm_disable_cudnn in configs/config.yml (false | true | auto, see
+    # 02_train.py); KOKORO_SLM_NO_CUDNN=1/0 forces it on/off.
+    slm_no_cudnn = bool(config.get("slm_disable_cudnn", False))
+    if os.environ.get("KOKORO_SLM_NO_CUDNN") in ("0", "1"):
+        slm_no_cudnn = os.environ["KOKORO_SLM_NO_CUDNN"] == "1"
+    print("SLM adversarial step cuDNN: %s (torch %s, CUDA %s, cuDNN %s)"
+          % ("DISABLED (native CUDA kernels)" if slm_no_cudnn else "enabled",
+             torch.__version__, torch.version.cuda, torch.backends.cudnn.version()))
+    try:
+        _torch_mm = tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:2])
+    except ValueError:
+        _torch_mm = None
+    if _torch_mm is not None and _torch_mm < (2, 8) and not slm_no_cudnn:
+        print("WARNING: torch %s is older than 2.8. With torch 2.6.0 / cuDNN 9.1.0 the SLM "
+              "adversarial step crashes in loss_gen_lm.backward() (CUDA illegal-memory-access "
+              "error). Install the pinned torch==2.8.0 / torchaudio==2.8.0, or set "
+              "stage2.slm_disable_cudnn: true (or KOKORO_SLM_NO_CUDNN=1)." % torch.__version__)
+
+    def _slm_cudnn_ctx():
+        if slm_no_cudnn:
+            return torch.backends.cudnn.flags(enabled=False)
+        return contextlib.nullcontext()
+
     for epoch in range(start_epoch, epochs):
         running_loss = 0
         start_time = time.time()
@@ -542,8 +581,11 @@ def main(config_path):
             if gt.size(-1) < 80:
                 continue
 
-            F0_real, _, _ = model.pitch_extractor(gt.unsqueeze(1))
-            N_real = log_norm(gt.unsqueeze(1)).squeeze(1)
+            # Targets only: pitch_extractor is never stepped in Stage 2.
+            # Same as upstream StyleTTS2 train_second.py (torch.no_grad()).
+            with torch.no_grad():
+                F0_real, _, _ = model.pitch_extractor(gt.unsqueeze(1))
+                N_real = log_norm(gt.unsqueeze(1)).squeeze(1)
 
             s_dur = model.predictor_encoder(
                 st.unsqueeze(1) if multispeaker else gt.unsqueeze(1)
@@ -553,7 +595,11 @@ def main(config_path):
             )
 
             y_rec_gt = wav.unsqueeze(1)
-            y_rec_gt_pred = model.decoder(en, F0_real, N_real, s)
+            # Reconstruction target only (used as the mel target before joint_epoch
+            # and only via .detach() inside SLMAdversarialLoss), so no graph is
+            # needed. Same as upstream StyleTTS2 train_second.py (torch.no_grad()).
+            with torch.no_grad():
+                y_rec_gt_pred = model.decoder(en, F0_real, N_real, s)
 
             if epoch >= joint_epoch:
                 # ground truth from recording
@@ -674,71 +720,80 @@ def main(config_path):
                     ref_lengths = input_lengths
                     ref_texts = texts
 
-                slm_out = slmadv(
-                    i,
-                    y_rec_gt,
-                    y_rec_gt_pred,
-                    waves,
-                    mel_input_length,
-                    ref_texts,
-                    ref_lengths,
-                    use_ind,
-                    s_trg.detach(),
-                    ref if multispeaker else None,
-                )
+                # Optional cuDNN fallback (stage2.slm_disable_cudnn / KOKORO_SLM_NO_CUDNN, off by
+                # default): runs the SLM-adversarial forward+backward without cuDNN when enabled.
+                with _slm_cudnn_ctx():
+                    slm_out = slmadv(
+                        i,
+                        y_rec_gt,
+                        y_rec_gt_pred,
+                        waves,
+                        mel_input_length,
+                        ref_texts,
+                        ref_lengths,
+                        use_ind,
+                        s_trg.detach(),
+                        ref if multispeaker else None,
+                    )
 
-                if slm_out is None:
-                    continue
+                    if slm_out is None:
+                        continue
 
-                d_loss_slm, loss_gen_lm, y_pred = slm_out
+                    d_loss_slm, loss_gen_lm, y_pred = slm_out
 
-                # SLM generator loss
-                optimizer.zero_grad()
-                loss_gen_lm.backward()
-
-                # compute the gradient norm
-                total_norm = {}
-                for key in model.keys():
-                    total_norm[key] = 0
-                    parameters = [
-                        p
-                        for p in model[key].parameters()
-                        if p.grad is not None and p.requires_grad
-                    ]
-                    for p in parameters:
-                        param_norm = p.grad.detach().data.norm(2)
-                        total_norm[key] += param_norm.item() ** 2
-                    total_norm[key] = total_norm[key] ** 0.5
-
-                # gradient scaling
-                if total_norm["predictor"] > slmadv_params.thresh:
-                    for key in model.keys():
-                        for p in model[key].parameters():
-                            if p.grad is not None:
-                                p.grad *= 1 / total_norm["predictor"]
-
-                for p in model.predictor.duration_proj.parameters():
-                    if p.grad is not None:
-                        p.grad *= slmadv_params.scale
-
-                for p in model.predictor.lstm.parameters():
-                    if p.grad is not None:
-                        p.grad *= slmadv_params.scale
-
-                for p in model.diffusion.parameters():
-                    if p.grad is not None:
-                        p.grad *= slmadv_params.scale
-
-                optimizer.step("bert_encoder")
-                optimizer.step("bert")
-                optimizer.step("predictor")
-                optimizer.step("diffusion")
-
-                # SLM discriminator loss
-                if d_loss_slm != 0:
+                    # SLM generator loss
                     optimizer.zero_grad()
-                    d_loss_slm.backward(retain_graph=True)
-                    optimizer.step("wd")
+                    loss_gen_lm.backward()
+
+                    # compute the gradient norm
+                    total_norm = {}
+                    for key in model.keys():
+                        total_norm[key] = 0
+                        parameters = [
+                            p
+                            for p in model[key].parameters()
+                            if p.grad is not None and p.requires_grad
+                        ]
+                        # One GPU->CPU sync per module instead of one per parameter
+                        # tensor (same value: sqrt of the sum of squared L2 norms).
+                        if parameters:
+                            total_norm[key] = (
+                                torch.stack([p.grad.detach().norm(2) for p in parameters])
+                                .pow(2)
+                                .sum()
+                                .sqrt()
+                                .item()
+                            )
+
+                    # gradient scaling
+                    if total_norm["predictor"] > slmadv_params.thresh:
+                        for key in model.keys():
+                            for p in model[key].parameters():
+                                if p.grad is not None:
+                                    p.grad *= 1 / total_norm["predictor"]
+
+                    for p in model.predictor.duration_proj.parameters():
+                        if p.grad is not None:
+                            p.grad *= slmadv_params.scale
+
+                    for p in model.predictor.lstm.parameters():
+                        if p.grad is not None:
+                            p.grad *= slmadv_params.scale
+
+                    for p in model.diffusion.parameters():
+                        if p.grad is not None:
+                            p.grad *= slmadv_params.scale
+
+                    optimizer.step("bert_encoder")
+                    optimizer.step("bert")
+                    optimizer.step("predictor")
+                    optimizer.step("diffusion")
+
+                    # SLM discriminator loss
+                    if d_loss_slm != 0:
+                        optimizer.zero_grad()
+                        d_loss_slm.backward(retain_graph=True)
+                        optimizer.step("wd")
 
             else:
                 d_loss_slm, loss_gen_lm = 0, 0
